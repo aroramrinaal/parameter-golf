@@ -4,6 +4,7 @@ import os
 
 
 FORWARDED_ENV_VARS = (
+    "EXPERIMENT_NAME",
     "DATA_VARIANT",
     "DATASET_TRAIN_SHARDS",
     "DATASET_WITH_DOCS",
@@ -72,4 +73,3 @@ def collect_forwarded_env(dataset_dir: str, tokenizer_path: str) -> dict[str, st
             env[key] = value
 
     return env
-

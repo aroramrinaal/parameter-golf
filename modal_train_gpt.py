@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import modal
@@ -54,6 +56,7 @@ MODAL_HELPERS_DIR = REPO_ROOT / "modal_helpers"
 REMOTE_PROJECT_DIR = Path("/root/parameter-golf")
 REMOTE_DATA_DIR = REMOTE_PROJECT_DIR / "data"
 REMOTE_HELPERS_DIR = Path("/root/modal_helpers")
+REMOTE_EXPERIMENTS_DIR = Path("/mnt/experiments")
 
 GPU_CONFIG = os.environ.get("MODAL_GPU", "H100")
 TIMEOUT_SECONDS = int(os.environ.get("MODAL_TIMEOUT_SECONDS", str(24 * 60 * 60)))
@@ -146,6 +149,9 @@ def _download_command(variant: str, env: dict[str, str] | None = None) -> list[s
 
 
 app = modal.App(APP_NAME)
+experiments_volume = modal.Volume.from_name(
+    "parameter-golf-experiments", create_if_missing=True
+)
 
 image = (
     modal.Image.debian_slim(python_version=PYTHON_VERSION)
@@ -176,7 +182,12 @@ if not DOWNLOAD_DATASET_IN_CONTAINER:
     ).add_local_file(local_tokenizer_path, remote_path=str(remote_tokenizer_path))
 
 
-@app.function(image=image, gpu=GPU_CONFIG, timeout=TIMEOUT_SECONDS)
+@app.function(
+    image=image,
+    gpu=GPU_CONFIG,
+    timeout=TIMEOUT_SECONDS,
+    volumes={str(REMOTE_EXPERIMENTS_DIR): experiments_volume},
+)
 def run_train(env: dict[str, str], nproc_per_node: int, variant: str) -> None:
     script_size = (REMOTE_PROJECT_DIR / "train_gpt.py").stat().st_size
     remote_env = os.environ.copy()
@@ -222,6 +233,27 @@ def run_train(env: dict[str, str], nproc_per_node: int, variant: str) -> None:
     print(f"[modal] Exit code: {completed.returncode}")
     if completed.returncode != 0:
         raise RuntimeError(f"torchrun exited with code {completed.returncode}")
+
+    experiment_name = env.get("EXPERIMENT_NAME", env.get("RUN_ID", "unnamed"))
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    tag = f"{experiment_name}_{timestamp}"
+
+    log_src = REMOTE_PROJECT_DIR / "logs" / f"{env.get('RUN_ID', 'run')}.txt"
+    log_dst = REMOTE_EXPERIMENTS_DIR / "logs"
+    log_dst.mkdir(parents=True, exist_ok=True)
+    if log_src.exists():
+        shutil.copy2(log_src, log_dst / f"{tag}.txt")
+        print(f"[modal] Saved log to {log_dst / f'{tag}.txt'}")
+
+    model_src = REMOTE_PROJECT_DIR / "final_model.int8.ptz"
+    model_dst = REMOTE_EXPERIMENTS_DIR / "models"
+    model_dst.mkdir(parents=True, exist_ok=True)
+    if model_src.exists():
+        shutil.copy2(model_src, model_dst / f"{tag}.int8.ptz")
+        print(f"[modal] Saved model to {model_dst / f'{tag}.int8.ptz'}")
+
+    experiments_volume.commit()
+    print("[modal] Experiment artifacts committed to volume.")
 
 
 @app.local_entrypoint()
