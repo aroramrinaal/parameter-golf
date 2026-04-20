@@ -40,6 +40,7 @@ import subprocess
 from pathlib import Path
 
 import modal
+from modal_helpers.env import collect_forwarded_env
 
 
 APP_NAME = "parameter-golf-train-gpt"
@@ -48,9 +49,11 @@ REPO_ROOT = Path(__file__).resolve().parent
 TRAIN_SCRIPT = REPO_ROOT / "train_gpt.py"
 DOWNLOAD_SCRIPT = REPO_ROOT / "data" / "cached_challenge_fineweb.py"
 REQUIREMENTS_FILE = REPO_ROOT / "requirements.txt"
+MODAL_HELPERS_DIR = REPO_ROOT / "modal_helpers"
 
 REMOTE_PROJECT_DIR = Path("/root/parameter-golf")
 REMOTE_DATA_DIR = REMOTE_PROJECT_DIR / "data"
+REMOTE_HELPERS_DIR = Path("/root/modal_helpers")
 
 GPU_CONFIG = os.environ.get("MODAL_GPU", "H100")
 TIMEOUT_SECONDS = int(os.environ.get("MODAL_TIMEOUT_SECONDS", str(24 * 60 * 60)))
@@ -142,84 +145,13 @@ def _download_command(variant: str, env: dict[str, str] | None = None) -> list[s
     return cmd
 
 
-def _remote_env_defaults(variant: str) -> dict[str, str]:
-    dataset_dir, tokenizer_path = _remote_dataset_paths(variant)
-    return {
-        "DATA_PATH": str(dataset_dir),
-        "TOKENIZER_PATH": str(tokenizer_path),
-        "PYTHONUNBUFFERED": "1",
-    }
-
-
-FORWARDED_ENV_VARS = (
-    "DATA_VARIANT",
-    "DATASET_TRAIN_SHARDS",
-    "DATASET_WITH_DOCS",
-    "DATASET_SKIP_MANIFEST",
-    "RUN_ID",
-    "SEED",
-    "VAL_BATCH_SIZE",
-    "VAL_LOSS_EVERY",
-    "TRAIN_LOG_EVERY",
-    "ITERATIONS",
-    "WARMDOWN_ITERS",
-    "WARMUP_STEPS",
-    "TRAIN_BATCH_TOKENS",
-    "TRAIN_SEQ_LEN",
-    "MAX_WALLCLOCK_SECONDS",
-    "QK_GAIN_INIT",
-    "VOCAB_SIZE",
-    "NUM_LAYERS",
-    "NUM_KV_HEADS",
-    "MODEL_DIM",
-    "NUM_HEADS",
-    "MLP_MULT",
-    "TIE_EMBEDDINGS",
-    "ROPE_BASE",
-    "LOGIT_SOFTCAP",
-    "EMBED_LR",
-    "HEAD_LR",
-    "TIED_EMBED_LR",
-    "TIED_EMBED_INIT_STD",
-    "MATRIX_LR",
-    "SCALAR_LR",
-    "MUON_MOMENTUM",
-    "MUON_BACKEND_STEPS",
-    "MUON_MOMENTUM_WARMUP_START",
-    "MUON_MOMENTUM_WARMUP_STEPS",
-    "BETA1",
-    "BETA2",
-    "ADAM_EPS",
-    "GRAD_CLIP_NORM",
-    "CONTROL_TENSOR_NAME_PATTERNS",
-    "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-    "MATCHED_FINEWEB_REPO_ID",
-    "MATCHED_FINEWEB_REMOTE_ROOT_PREFIX",
-)
-
-
-def _collect_forwarded_env(variant: str) -> dict[str, str]:
-    env = _remote_env_defaults(variant)
-    for key in FORWARDED_ENV_VARS:
-        value = os.environ.get(key)
-        if value is not None:
-            env[key] = value
-
-    extra_env = os.environ.get("FORWARDED_ENV_VARS", "")
-    for key in [item.strip() for item in extra_env.split(",") if item.strip()]:
-        value = os.environ.get(key)
-        if value is not None:
-            env[key] = value
-
-    return env
-
-
 app = modal.App(APP_NAME)
 
 image = (
     modal.Image.debian_slim(python_version=PYTHON_VERSION)
     .pip_install_from_requirements(str(REQUIREMENTS_FILE))
     .workdir(str(REMOTE_PROJECT_DIR))
+    .add_local_dir(str(MODAL_HELPERS_DIR), remote_path=str(REMOTE_HELPERS_DIR))
     .add_local_file(TRAIN_SCRIPT, remote_path=str(REMOTE_PROJECT_DIR / "train_gpt.py"))
     .add_local_file(
         DOWNLOAD_SCRIPT,
@@ -297,10 +229,13 @@ def main() -> None:
     _require_file(TRAIN_SCRIPT, description="train_gpt.py")
     _require_file(DOWNLOAD_SCRIPT, description="data/cached_challenge_fineweb.py")
     _require_file(REQUIREMENTS_FILE, description="requirements.txt")
+    if not MODAL_HELPERS_DIR.is_dir():
+        raise FileNotFoundError(f"modal_helpers directory was not found at {MODAL_HELPERS_DIR}")
 
     variant = _infer_data_variant()
     nproc_per_node = int(
         os.environ.get("NPROC_PER_NODE", str(_infer_nproc_per_node(GPU_CONFIG)))
     )
-    env = _collect_forwarded_env(variant)
+    dataset_dir, tokenizer_path = _remote_dataset_paths(variant)
+    env = collect_forwarded_env(str(dataset_dir), str(tokenizer_path))
     run_train.remote(env=env, nproc_per_node=nproc_per_node, variant=variant)
