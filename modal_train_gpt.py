@@ -187,6 +187,7 @@ if not DOWNLOAD_DATASET_IN_CONTAINER:
     gpu=GPU_CONFIG,
     timeout=TIMEOUT_SECONDS,
     volumes={str(REMOTE_EXPERIMENTS_DIR): experiments_volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def run_train(env: dict[str, str], nproc_per_node: int, variant: str) -> None:
     script_size = (REMOTE_PROJECT_DIR / "train_gpt.py").stat().st_size
