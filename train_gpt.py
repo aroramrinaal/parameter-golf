@@ -65,11 +65,14 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    physical_layers = int(os.environ.get("PHYSICAL_LAYERS", num_layers))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    depth_embedding = bool(int(os.environ.get("DEPTH_EMBEDDING", "0")))
+    virtual_layer_scales = bool(int(os.environ.get("VIRTUAL_LAYER_SCALES", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -519,7 +522,11 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        (
+            "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,"
+            "virtual_attn_scale,virtual_attn_scales,virtual_mlp_scale,virtual_mlp_scales,"
+            "virtual_resid_mix,virtual_resid_mixes,depth_embed,q_gain,skip_weight,skip_weights"
+        ),
     ).split(",")
     if pattern
 )
@@ -866,12 +873,22 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        resid_mix_override: Tensor | None = None,
+        attn_scale_override: Tensor | None = None,
+        mlp_scale_override: Tensor | None = None,
+    ) -> Tensor:
+        mix_src = self.resid_mix if resid_mix_override is None else resid_mix_override
+        attn_scale_src = self.attn_scale if attn_scale_override is None else attn_scale_override
+        mlp_scale_src = self.mlp_scale if mlp_scale_override is None else mlp_scale_override
+        mix = mix_src.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + attn_scale_src.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + mlp_scale_src.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -880,12 +897,15 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        physical_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
+        depth_embedding: bool,
+        virtual_layer_scales: bool,
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
@@ -893,14 +913,32 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if physical_layers <= 0:
+            raise ValueError(f"physical_layers must be positive, got {physical_layers}")
+        if physical_layers > num_layers:
+            raise ValueError(
+                f"physical_layers must be <= num_layers, got physical_layers={physical_layers} num_layers={num_layers}"
+            )
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
+        self.physical_layers = physical_layers
+        self.depth_embedding_enabled = depth_embedding
+        self.virtual_layer_scales_enabled = virtual_layer_scales
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        encoder_block_ids, decoder_block_ids = self._build_block_schedule(
+            num_layers,
+            physical_layers,
+            self.num_encoder_layers,
+            self.num_decoder_layers,
+        )
+        self.encoder_block_ids = tuple(encoder_block_ids)
+        self.decoder_block_ids = tuple(decoder_block_ids)
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -911,14 +949,51 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for _ in range(physical_layers)
             ]
         )
+        if depth_embedding:
+            self.depth_embed = nn.Parameter(torch.zeros(num_layers, model_dim, dtype=torch.float32))
+        else:
+            self.register_parameter("depth_embed", None)
+        if virtual_layer_scales:
+            self.virtual_attn_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+            self.virtual_mlp_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+            self.virtual_resid_mixes = nn.Parameter(
+                torch.stack(
+                    (
+                        torch.ones((num_layers, model_dim), dtype=torch.float32),
+                        torch.zeros((num_layers, model_dim), dtype=torch.float32),
+                    ),
+                    dim=1,
+                )
+            )
+        else:
+            self.register_parameter("virtual_attn_scales", None)
+            self.register_parameter("virtual_mlp_scales", None)
+            self.register_parameter("virtual_resid_mixes", None)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
+
+    @staticmethod
+    def _build_block_schedule(
+        num_layers: int,
+        physical_layers: int,
+        num_encoder_layers: int,
+        num_decoder_layers: int,
+    ) -> tuple[list[int], list[int]]:
+        if physical_layers == num_layers:
+            return (
+                list(range(num_encoder_layers)),
+                list(range(num_encoder_layers, num_layers)),
+            )
+        return (
+            [i % physical_layers for i in range(num_encoder_layers)],
+            [physical_layers - 1 - (i % physical_layers) for i in range(num_decoder_layers)],
+        )
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -926,6 +1001,27 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def _run_virtual_block(self, x: Tensor, x0: Tensor, virtual_idx: int, physical_idx: int) -> Tensor:
+        block = self.blocks[physical_idx]
+        if self.depth_embed is not None:
+            x = x + self.depth_embed[virtual_idx].to(dtype=x.dtype)[None, None, :]
+        resid_mix = None
+        if self.virtual_resid_mixes is not None:
+            resid_mix = block.resid_mix * self.virtual_resid_mixes[virtual_idx]
+        attn_scale = None
+        if self.virtual_attn_scales is not None:
+            attn_scale = block.attn_scale * self.virtual_attn_scales[virtual_idx]
+        mlp_scale = None
+        if self.virtual_mlp_scales is not None:
+            mlp_scale = block.mlp_scale * self.virtual_mlp_scales[virtual_idx]
+        return block(
+            x,
+            x0,
+            resid_mix_override=resid_mix,
+            attn_scale_override=attn_scale,
+            mlp_scale_override=mlp_scale,
+        )
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean") -> Tensor:
         x = self.tok_emb(input_ids)
@@ -935,12 +1031,17 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self._run_virtual_block(x, x0, i, self.encoder_block_ids[i])
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self._run_virtual_block(
+                x,
+                x0,
+                self.num_encoder_layers + i,
+                self.decoder_block_ids[i],
+            )
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1067,12 +1168,15 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        physical_layers=args.physical_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
+        depth_embedding=args.depth_embedding,
+        virtual_layer_scales=args.virtual_layer_scales,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
@@ -1089,19 +1193,19 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        for name, p in base_model.named_parameters()
+        if name not in {"tok_emb.weight", "lm_head.weight"}
+        and p.ndim == 2
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        for name, p in base_model.named_parameters()
+        if name not in {"tok_emb.weight", "lm_head.weight"}
+        and (p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1135,6 +1239,11 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(
+        f"virtual_layers:{args.num_layers} physical_layers:{args.physical_layers} "
+        f"depth_embedding:{int(args.depth_embedding)} virtual_layer_scales:{int(args.virtual_layer_scales)}"
+    )
+    log0(f"encoder_block_ids:{list(base_model.encoder_block_ids)} decoder_block_ids:{list(base_model.decoder_block_ids)}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")

@@ -7,6 +7,7 @@
 
 - `env-only baseline`: experiments 0-5 below, all launched through `modal_train_gpt.py` with forwarded env only and the stock baseline evaluation path.
 - `sliding-eval code`: reserved for runs after the `train_gpt.py` code change that adds `EVAL_MODE`, `EVAL_SLIDING_STRIDE`, and `EVAL_CONTEXT_LEN`.
+- `universal-transformer code`: reserved for runs after the `train_gpt.py` code change that adds `PHYSICAL_LAYERS`, `DEPTH_EMBEDDING`, and `VIRTUAL_LAYER_SCALES` for shared-block virtual depth.
 
 ## results
 
@@ -21,3 +22,4 @@
 | 6 | sliding-eval code | seq2048 standard | sliding-eval code | `sp1024` / `sp1024` | standard | 1 | `TRAIN_SEQ_LEN=2048` | 1.36353 | -0.0043 | 1022 | 12.50 MB | yes |
 | 7 | sliding-eval code | seq2048 sliding64 rerun | sliding-eval code | `sp1024` / `sp1024` | sliding (stride=64) | 6 | `TRAIN_SEQ_LEN=2048` + `EVAL_MODE=sliding` + `EVAL_SLIDING_STRIDE=64` + `EVAL_CONTEXT_LEN=2048` | 1.31375 | -0.0541 | 1528 | 14.07 MB | yes |
 | 8 | sliding-eval code | sp4096 seq2048 sliding64 repooverride | sliding-eval code | `sp4096` / `sp4096` | sliding (stride=64) | 7 only for eval-style, not tokenizer-family | `MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf` + `VOCAB_SIZE=4096` + `DATA_VARIANT=sp4096` + `TRAIN_SEQ_LEN=2048` + `EVAL_MODE=sliding` + `EVAL_SLIDING_STRIDE=64` + `EVAL_CONTEXT_LEN=2048` | 1.28724 | -0.0806 | 1456 | 15.37 MB | yes |
+| 9 | universal-transformer code | sp4096 universal-transformer main | universal-transformer code | `sp4096` / `sp4096` | sliding (stride=64) | 8 | `MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf` + `VOCAB_SIZE=4096` + `DATA_VARIANT=sp4096` + `TRAIN_SEQ_LEN=2048` + `NUM_LAYERS=12` + `PHYSICAL_LAYERS=3` + `MODEL_DIM=640` + `NUM_HEADS=10` + `NUM_KV_HEADS=5` + `MLP_MULT=3` + `DEPTH_EMBEDDING=1` + `VIRTUAL_LAYER_SCALES=1` + `EVAL_MODE=sliding` + `EVAL_SLIDING_STRIDE=64` + `EVAL_CONTEXT_LEN=2048` | 1.35815 | -0.0097 | 811 | 9.64 MB | yes |
