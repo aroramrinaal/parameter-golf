@@ -70,6 +70,10 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    random_mlp_proj = bool(int(os.environ.get("RANDOM_MLP_PROJ", "0")))
+    random_mlp_proj_rank = int(os.environ.get("RANDOM_MLP_PROJ_RANK", 32))
+    random_mlp_proj_gain = bool(int(os.environ.get("RANDOM_MLP_PROJ_GAIN", "1")))
+    random_mlp_proj_seed = int(os.environ.get("RANDOM_MLP_PROJ_SEED", seed))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     depth_embedding = bool(int(os.environ.get("DEPTH_EMBEDDING", "0")))
     virtual_layer_scales = bool(int(os.environ.get("VIRTUAL_LAYER_SCALES", "0")))
@@ -750,6 +754,23 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class RandomProjAdapter(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, rank: int, seed: int, gain: bool):
+        super().__init__()
+        g = torch.Generator(device="cpu"); g.manual_seed(seed)
+        w = torch.randn((out_dim, in_dim), generator=g, dtype=torch.float32) / math.sqrt(in_dim)
+        self.register_buffer("random_weight", w, persistent=False)
+        self.down = CastedLinear(in_dim, rank, bias=False)
+        self.up = CastedLinear(rank, out_dim, bias=False); self.up._zero_init = True
+        self.gain = nn.Parameter(torch.ones(out_dim, dtype=torch.float32)) if gain else None
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = F.linear(x, self.random_weight.to(dtype=x.dtype))
+        if self.gain is not None:
+            y = (y.reshape(-1, y.size(-1)) * self.gain.to(dtype=x.dtype)).view_as(y)
+        return y + self.up(self.down(x))
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -842,11 +863,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, random_proj: bool, random_proj_rank: int, random_proj_seed: int, random_proj_gain: bool):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj = RandomProjAdapter(hidden, dim, random_proj_rank, random_proj_seed, random_proj_gain) if random_proj else CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -855,20 +876,12 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, random_mlp_proj: bool, random_mlp_proj_rank: int, random_mlp_proj_seed: int, random_mlp_proj_gain: bool, rope_base: float, qk_gain_init: float):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, random_mlp_proj, random_mlp_proj_rank, random_mlp_proj_seed, random_mlp_proj_gain)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -893,23 +906,7 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        num_layers: int,
-        physical_layers: int,
-        model_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        tie_embeddings: bool,
-        tied_embed_init_std: float,
-        depth_embedding: bool,
-        virtual_layer_scales: bool,
-        logit_softcap: float,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, vocab_size: int, num_layers: int, physical_layers: int, model_dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, random_mlp_proj: bool, random_mlp_proj_rank: int, random_mlp_proj_seed: int, random_mlp_proj_gain: bool, tie_embeddings: bool, tied_embed_init_std: float, depth_embedding: bool, virtual_layer_scales: bool, logit_softcap: float, rope_base: float, qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -946,6 +943,10 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
+                    random_mlp_proj,
+                    random_mlp_proj_rank,
+                    random_mlp_proj_seed,
+                    random_mlp_proj_gain,
                     rope_base,
                     qk_gain_init,
                 )
@@ -1173,6 +1174,10 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        random_mlp_proj=args.random_mlp_proj,
+        random_mlp_proj_rank=args.random_mlp_proj_rank,
+        random_mlp_proj_seed=args.random_mlp_proj_seed,
+        random_mlp_proj_gain=args.random_mlp_proj_gain,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         depth_embedding=args.depth_embedding,
@@ -1185,7 +1190,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = base_model if args.random_mlp_proj else torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
