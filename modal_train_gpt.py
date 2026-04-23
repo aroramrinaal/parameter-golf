@@ -30,6 +30,13 @@ Optional fallback:
     Set `DOWNLOAD_DATASET_IN_CONTAINER=0` to skip the remote download step and
     instead upload a local dataset/tokenizer via `LOCAL_DATA_PATH` and
     `LOCAL_TOKENIZER_PATH`.
+
+If you want the record-style Hopper attention backend, add:
+
+    INSTALL_FLASH_ATTN_3=1 \
+    FLASH_ATTN_3_INDEX_URL=https://download.pytorch.org/whl/cu128 \
+    ATTN_BACKEND=flash3 \
+    modal run modal_train_gpt.py
 """
 
 from __future__ import annotations
@@ -64,6 +71,12 @@ TORCHRUN_EXTRA_ARGS = shlex.split(os.environ.get("TORCHRUN_EXTRA_ARGS", ""))
 DOWNLOAD_DATASET_IN_CONTAINER = (
     os.environ.get("DOWNLOAD_DATASET_IN_CONTAINER", "1") != "0"
 )
+INSTALL_FLASH_ATTN_3 = os.environ.get("INSTALL_FLASH_ATTN_3", "0") == "1"
+FLASH_ATTN_3_INDEX_URL = os.environ.get(
+    "FLASH_ATTN_3_INDEX_URL",
+    "https://download.pytorch.org/whl/cu128",
+)
+FLASH_ATTN_3_FIND_LINKS = os.environ.get("FLASH_ATTN_3_FIND_LINKS", "").strip()
 
 
 def _require_file(path: Path, *, description: str) -> Path:
@@ -153,10 +166,29 @@ experiments_volume = modal.Volume.from_name(
     "parameter-golf-experiments", create_if_missing=True
 )
 
+
+def _flash_attn_3_install_command() -> str:
+    if FLASH_ATTN_3_FIND_LINKS:
+        return (
+            "python -m pip install --no-deps flash_attn_3 --find-links "
+            f"{shlex.quote(FLASH_ATTN_3_FIND_LINKS)}"
+        )
+    return (
+        "python -m pip install --no-deps flash-attn-3 --index-url "
+        f"{shlex.quote(FLASH_ATTN_3_INDEX_URL)}"
+    )
+
 image = (
     modal.Image.debian_slim(python_version=PYTHON_VERSION)
     .pip_install_from_requirements(str(REQUIREMENTS_FILE))
     .workdir(str(REMOTE_PROJECT_DIR))
+)
+
+if INSTALL_FLASH_ATTN_3:
+    image = image.run_commands(_flash_attn_3_install_command())
+
+image = (
+    image
     .add_local_dir(str(MODAL_HELPERS_DIR), remote_path=str(REMOTE_HELPERS_DIR))
     .add_local_file(TRAIN_SCRIPT, remote_path=str(REMOTE_PROJECT_DIR / "train_gpt.py"))
     .add_local_file(
@@ -195,6 +227,14 @@ def run_train(env: dict[str, str], nproc_per_node: int, variant: str) -> None:
     remote_env.update(env)
 
     if DOWNLOAD_DATASET_IN_CONTAINER:
+        manifest_exists = (REMOTE_DATA_DIR / "manifest.json").is_file()
+        if remote_env.get("DATASET_SKIP_MANIFEST", "0") == "1" and not manifest_exists:
+            print(
+                "[modal] DATASET_SKIP_MANIFEST=1 requested, but no local manifest exists in the container yet. "
+                "Falling back to manifest download for this run."
+            )
+            remote_env = remote_env.copy()
+            remote_env.pop("DATASET_SKIP_MANIFEST", None)
         download_cmd = _download_command(variant, env=remote_env)
         print(f"[modal] Downloading dataset with: {' '.join(download_cmd)}")
         completed = subprocess.run(
@@ -210,6 +250,61 @@ def run_train(env: dict[str, str], nproc_per_node: int, variant: str) -> None:
             )
     else:
         print("[modal] Using uploaded local dataset/tokenizer files.")
+
+    if remote_env.get("ATTN_BACKEND", "").strip().lower() == "flash3":
+        flash_probe = """
+import importlib.metadata
+import importlib.util
+import sys
+import traceback
+import torch
+
+print(
+    f"[modal] flash3-preflight torch={torch.__version__} "
+    f"cuda={torch.version.cuda} python={sys.version.split()[0]}"
+)
+for dist_name in ("flash-attn-3", "flash_attn_3"):
+    try:
+        print(f"[modal] flash3-preflight dist {dist_name}={importlib.metadata.version(dist_name)}")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+print(
+    "[modal] flash3-preflight flash_attn_interface_spec="
+    f"{importlib.util.find_spec('flash_attn_interface')!r}"
+)
+try:
+    import flash_attn_interface as flash_attn_interface_module
+    from flash_attn_interface import flash_attn_func
+
+    print(
+        "[modal] flash3-preflight flash_attn_interface_file="
+        f"{getattr(flash_attn_interface_module, '__file__', '<unknown>')}"
+    )
+    print(f"[modal] flash3-preflight flash_attn_func_ok={flash_attn_func is not None}")
+except Exception:
+    traceback.print_exc()
+    raise
+""".strip()
+        probe_cmd = ["python3", "-c", flash_probe]
+        print(f"[modal] Running FlashAttention preflight: {' '.join(probe_cmd[:2])} ...")
+        completed = subprocess.run(
+            probe_cmd,
+            cwd=str(REMOTE_PROJECT_DIR),
+            env=remote_env,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if completed.stdout:
+            print(completed.stdout, end="")
+        if completed.stderr:
+            print(completed.stderr, end="")
+        print(f"[modal] FlashAttention preflight exit code: {completed.returncode}")
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "FlashAttention 3 preflight failed before torchrun. "
+                "See the import traceback above for the real failure."
+            )
 
     cmd = [
         "torchrun",
