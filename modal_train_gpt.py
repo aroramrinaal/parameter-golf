@@ -246,12 +246,12 @@ def run_train(env: dict[str, str], nproc_per_node: int, variant: str) -> None:
         shutil.copy2(log_src, log_dst / f"{tag}.txt")
         print(f"[modal] Saved log to {log_dst / f'{tag}.txt'}")
 
-    model_src = REMOTE_PROJECT_DIR / "final_model.int8.ptz"
+    model_src = REMOTE_PROJECT_DIR / "final_model.int8.ptbr"
     model_dst = REMOTE_EXPERIMENTS_DIR / "models"
     model_dst.mkdir(parents=True, exist_ok=True)
     if model_src.exists():
-        shutil.copy2(model_src, model_dst / f"{tag}.int8.ptz")
-        print(f"[modal] Saved model to {model_dst / f'{tag}.int8.ptz'}")
+        shutil.copy2(model_src, model_dst / f"{tag}.int8.ptbr")
+        print(f"[modal] Saved model to {model_dst / f'{tag}.int8.ptbr'}")
 
     experiments_volume.commit()
     print("[modal] Experiment artifacts committed to volume.")
