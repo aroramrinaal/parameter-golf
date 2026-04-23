@@ -782,10 +782,20 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_AFFINE_OFFSET_DTYPE = torch.float16
 SDCLIP_STD_MULT = 2.5
 EMBED_GPTQ_CLIP_STD_MULTS = (8.0, 12.0, 16.0, 20.0, 24.0)
-MATRIX_GPTQ_CLIP_STD_MULTS = (4.0, 6.0, 8.0, 10.0, 12.85, 16.0)
+MATRIX_INT8_GPTQ_CLIP_STD_MULTS = (8.0, 12.0, 16.0, 20.0, 24.0)
+MLP_INT6_GPTQ_CLIP_STD_MULTS = (4.0, 6.0, 8.0, 10.0, 12.85, 16.0)
 GPTQ_CALIBRATION_BATCHES = 8
 MATRIX_QUANT_BITS = 6
 MATRIX_QUANT_QMAX = (1 << (MATRIX_QUANT_BITS - 1)) - 1
+QUANT_INT6_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "QUANT_INT6_NAME_PATTERNS",
+        "mlp.fc.weight,mlp.proj.weight",
+    ).split(",")
+    if pattern
+)
+QUANT_BYTE_SHUFFLE = bool(int(os.environ.get("QUANT_BYTE_SHUFFLE", "0")))
 BYTE_SHUFFLE_GROUP_SIZE = 8
 
 def tensor_nbytes(t: Tensor) -> int:
@@ -895,6 +905,43 @@ def _byte_unshuffle_bytes(data: bytes, group_size: int) -> bytes:
         out[lane_idx::group_size] = lane
     return bytes(out)
 
+
+def quant_group_for_name(name: str) -> str:
+    if name == "tok_emb.weight" or name == "lm_head.weight":
+        return "embedding"
+    if ".attn." in name:
+        return "attention"
+    if ".mlp." in name:
+        return "mlp"
+    if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+        return "control"
+    if "norm" in name:
+        return "norm"
+    return "misc"
+
+
+def make_quant_group_stats() -> dict[str, dict[str, int]]:
+    return {
+        group: {"raw_bytes": 0, "payload_bytes": 0, "int6_bytes": 0, "num_tensors": 0}
+        for group in ("embedding", "attention", "mlp", "control", "norm", "misc")
+    }
+
+
+def record_quant_group_stats(
+    stats: dict[str, object],
+    name: str,
+    *,
+    raw_bytes: int,
+    payload_bytes: int,
+    int6_bytes: int = 0,
+) -> None:
+    group = quant_group_for_name(name)
+    group_stats = stats["group_stats"][group]
+    group_stats["raw_bytes"] += raw_bytes
+    group_stats["payload_bytes"] += payload_bytes
+    group_stats["int6_bytes"] += int6_bytes
+    group_stats["num_tensors"] += 1
+
 def quantize_float_tensor_sdclip(t: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -980,7 +1027,12 @@ def collect_gptq_calibration(model: "GPT", train_files: str, train_seq_len: int,
 
 
 def should_quantize_matrix_int6(name: str, t: Tensor) -> bool:
-    return t.ndim == 2 and name != "tok_emb.weight" and t.numel() > INT8_KEEP_FLOAT_MAX_NUMEL
+    return (
+        t.ndim == 2
+        and name != "tok_emb.weight"
+        and t.numel() > INT8_KEEP_FLOAT_MAX_NUMEL
+        and any(pattern in name for pattern in QUANT_INT6_NAME_PATTERNS)
+    )
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], gptq_calibration: dict[str, Tensor] | None = None):
     # Single supported clean-script export format:
@@ -1007,17 +1059,21 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], gptq_calibration: di
         ),
         0,
     )
+    stats["group_stats"] = make_quant_group_stats()
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
+        raw_bytes = tensor_nbytes(t)
         stats["param_count"] += int(t.numel())
         stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        stats["baseline_tensor_bytes"] += raw_bytes
 
         if not t.is_floating_point():
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            payload_bytes = tensor_nbytes(t)
+            stats["int8_payload_bytes"] += payload_bytes
+            record_quant_group_stats(stats, name, raw_bytes=raw_bytes, payload_bytes=payload_bytes)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -1025,7 +1081,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], gptq_calibration: di
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            payload_bytes = tensor_nbytes(kept)
+            stats["int8_payload_bytes"] += payload_bytes
+            record_quant_group_stats(stats, name, raw_bytes=raw_bytes, payload_bytes=payload_bytes)
             continue
 
         stats["num_float_tensors"] += 1
@@ -1035,11 +1093,13 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], gptq_calibration: di
             quantized[name] = q
             scales[name] = s
             dtypes[name] = str(t.dtype).removeprefix("torch.")
-            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+            payload_bytes = tensor_nbytes(q) + tensor_nbytes(s)
+            stats["int8_payload_bytes"] += payload_bytes
+            record_quant_group_stats(stats, name, raw_bytes=raw_bytes, payload_bytes=payload_bytes)
             continue
         if should_quantize_matrix_int6(name, t):
             hdiag = gptq_calibration.get(name) if gptq_calibration is not None else None
-            q, s = _quantize_rowwise_gptq_symmetric(t, hdiag, MATRIX_QUANT_QMAX, MATRIX_GPTQ_CLIP_STD_MULTS)
+            q, s = _quantize_rowwise_gptq_symmetric(t, hdiag, MATRIX_QUANT_QMAX, MLP_INT6_GPTQ_CLIP_STD_MULTS)
             packed, original_numel = _pack_int6_signed(q)
             qmeta[name] = {
                 "scheme": "gptq_diag_per_row_int6_packed",
@@ -1050,8 +1110,28 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], gptq_calibration: di
             quantized[name] = packed
             scales[name] = s
             dtypes[name] = str(t.dtype).removeprefix("torch.")
-            stats["int6_packed_bytes"] += tensor_nbytes(packed)
-            stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
+            packed_bytes = tensor_nbytes(packed)
+            payload_bytes = packed_bytes + tensor_nbytes(s)
+            stats["int6_packed_bytes"] += packed_bytes
+            stats["int8_payload_bytes"] += payload_bytes
+            record_quant_group_stats(
+                stats,
+                name,
+                raw_bytes=raw_bytes,
+                payload_bytes=payload_bytes,
+                int6_bytes=packed_bytes,
+            )
+            continue
+        if t.ndim == 2:
+            hdiag = gptq_calibration.get(name) if gptq_calibration is not None else None
+            q, s = _quantize_rowwise_gptq_symmetric(t, hdiag, 127, MATRIX_INT8_GPTQ_CLIP_STD_MULTS)
+            qmeta[name] = {"scheme": "gptq_diag_per_row", "axis": 0}
+            quantized[name] = q
+            scales[name] = s
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            payload_bytes = tensor_nbytes(q) + tensor_nbytes(s)
+            stats["int8_payload_bytes"] += payload_bytes
+            record_quant_group_stats(stats, name, raw_bytes=raw_bytes, payload_bytes=payload_bytes)
             continue
         else:
             q, s, offset = quantize_float_tensor_sdclip(t)
@@ -1060,9 +1140,12 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], gptq_calibration: di
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        payload_bytes = tensor_nbytes(q) + tensor_nbytes(s)
+        stats["int8_payload_bytes"] += payload_bytes
         if name in offsets:
+            payload_bytes += tensor_nbytes(offsets[name])
             stats["int8_payload_bytes"] += tensor_nbytes(offsets[name])
+        record_quant_group_stats(stats, name, raw_bytes=raw_bytes, payload_bytes=payload_bytes)
 
     obj: dict[str, object] = {
         "__quant_format__": "int6_int8_sdclip_gptq_v3",
@@ -2008,7 +2091,12 @@ def main() -> None:
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
-        quant_blob = brotli.compress(_byte_shuffle_bytes(quant_raw, BYTE_SHUFFLE_GROUP_SIZE), quality=11)
+        quant_bytes_for_brotli = (
+            _byte_shuffle_bytes(quant_raw, BYTE_SHUFFLE_GROUP_SIZE)
+            if QUANT_BYTE_SHUFFLE
+            else quant_raw
+        )
+        quant_blob = brotli.compress(quant_bytes_for_brotli, quality=11)
         quant_raw_bytes = len(quant_raw)
         with open("final_model.int8.ptbr", "wb") as f:
             f.write(quant_blob)
@@ -2018,15 +2106,27 @@ def main() -> None:
         log0(
             f"Serialized model int8+brotli: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} "
-            f"payload_ratio:{ratio:.2f}x int6_bytes:{quant_stats['int6_packed_bytes']})"
+            f"payload_ratio:{ratio:.2f}x int6_bytes:{quant_stats['int6_packed_bytes']} "
+            f"byte_shuffle:{int(QUANT_BYTE_SHUFFLE)})"
         )
         log0(f"Total submission size int8+brotli: {quant_file_bytes + code_bytes} bytes")
+        for group_name, group_stats in quant_stats["group_stats"].items():
+            if group_stats["num_tensors"] <= 0:
+                continue
+            group_ratio = group_stats["raw_bytes"] / max(group_stats["payload_bytes"], 1)
+            log0(
+                f"quant_group:{group_name} tensors:{group_stats['num_tensors']} "
+                f"raw_bytes:{group_stats['raw_bytes']} payload_bytes:{group_stats['payload_bytes']} "
+                f"int6_bytes:{group_stats['int6_bytes']} payload_ratio:{group_ratio:.2f}x"
+            )
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptbr", "rb") as f:
         quant_blob_disk = f.read()
-    quant_raw_disk = _byte_unshuffle_bytes(brotli.decompress(quant_blob_disk), BYTE_SHUFFLE_GROUP_SIZE)
+    quant_raw_disk = brotli.decompress(quant_blob_disk)
+    if QUANT_BYTE_SHUFFLE:
+        quant_raw_disk = _byte_unshuffle_bytes(quant_raw_disk, BYTE_SHUFFLE_GROUP_SIZE)
     quant_state = torch.load(io.BytesIO(quant_raw_disk), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
