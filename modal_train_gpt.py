@@ -76,7 +76,6 @@ FLASH_ATTN_3_INDEX_URL = os.environ.get(
     "FLASH_ATTN_3_INDEX_URL",
     "https://download.pytorch.org/whl/cu128",
 )
-FLASH_ATTN_3_FIND_LINKS = os.environ.get("FLASH_ATTN_3_FIND_LINKS", "").strip()
 
 
 def _require_file(path: Path, *, description: str) -> Path:
@@ -168,11 +167,6 @@ experiments_volume = modal.Volume.from_name(
 
 
 def _flash_attn_3_install_command() -> str:
-    if FLASH_ATTN_3_FIND_LINKS:
-        return (
-            "python -m pip install --no-deps flash_attn_3 --find-links "
-            f"{shlex.quote(FLASH_ATTN_3_FIND_LINKS)}"
-        )
     return (
         "python -m pip install --no-deps flash-attn-3 --index-url "
         f"{shlex.quote(FLASH_ATTN_3_INDEX_URL)}"
