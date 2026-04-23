@@ -172,8 +172,16 @@ def _flash_attn_3_install_command() -> str:
         f"{shlex.quote(FLASH_ATTN_3_INDEX_URL)}"
     )
 
+if INSTALL_FLASH_ATTN_3:
+    image = modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+        add_python=PYTHON_VERSION,
+    )
+else:
+    image = modal.Image.debian_slim(python_version=PYTHON_VERSION)
+
 image = (
-    modal.Image.debian_slim(python_version=PYTHON_VERSION)
+    image
     .pip_install_from_requirements(str(REQUIREMENTS_FILE))
     .workdir(str(REMOTE_PROJECT_DIR))
 )
