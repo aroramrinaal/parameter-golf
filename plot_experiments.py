@@ -227,7 +227,7 @@ def main():
     ax.annotate(
         f"BEST  {best['val_bpb']:.5f}\n{best['experiment'][:40]}",
         xy=(best["num"], best["val_bpb"]),
-        xytext=(best["num"] - 4, best["val_bpb"] + 0.025),
+        xytext=(best["num"] - 2, best["val_bpb"] + 0.04),
         fontsize=9,
         color="#333333",
         ha="center",
@@ -299,6 +299,7 @@ def main():
     y_pad = max(0.04, (y_max - y_min) * 0.12)
     ax.set_ylim(max(1.18, y_min - y_pad), y_max + y_pad + 0.03)
     ax.set_xlim(min(x) - 0.8, max(x) + 2)
+    ax.set_xticks(range(min(x), max(x) + 1))
 
     # ------------------------------------------------------------------
     # Legends (phase + validity)
